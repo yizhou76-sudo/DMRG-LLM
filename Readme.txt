@@ -1,1 +1,1 @@
-The file name follows the format "MPS-LLM1-LLM2" or, when LLM1 and LLM2 are identical, "MPS-LLM1".
+LLM conversations (Kimi 2.5, Gemini 3.1 Pro Preview, GPT 5.4, Claude 4.6) are in 'Markdown'. Generated Python code is in 'Code', LaTeX notes are in 'LaTeX', and figure plotting prompts (via Nano Banana 2) are in 'FigPrompt'.

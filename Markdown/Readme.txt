@@ -1,0 +1,1 @@
+Conversations with LLMs (Kimi 2.5, Gemini 3.1 Pro Preview, GPT 5.4, and Claude 4.6) are organized by topic: LaTeX notes are saved in 'TeX', and coding conversations in 'Code'.
