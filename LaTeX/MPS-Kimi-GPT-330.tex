@@ -1,0 +1,1902 @@
+\documentclass[aps,prb,onecolumn,nofootinbib]{revtex4-2}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+\usepackage{graphicx}
+\usepackage{amsmath,amsfonts,amssymb,bm,mathtools}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{xcolor}
+
+\makeatletter
+\providecommand{\ALG@name}{Algorithm}
+\makeatother
+
+\usepackage[colorlinks=true,urlcolor=blue,linkcolor=blue,citecolor=blue]{hyperref}
+
+\newcommand{\ket}[1]{|#1\rangle}
+\newcommand{\bra}[1]{\langle #1|}
+\newcommand{\braket}[2]{\langle #1 \mid #2 \rangle}
+\newcommand{\Tr}{\mathrm{Tr}}
+\newcommand{\Id}{\mathbb{I}}
+\newcommand{\eps}{\epsilon}
+\newcommand{\Order}{\mathcal{O}}
+
+\begin{document}
+	
+	\title{\texorpdfstring{Numerical Implementation of Matrix Product States and DMRG\\
+			\large Based on the review article ``The density-matrix renormalization group in the age of matrix product states'' by U.~Schollw\"ock, Annals of Physics \textbf{326}, 96--192 (2011)}
+		{Numerical Implementation of Matrix Product States and DMRG}}
+	
+	\author{Kimi 2.5}
+	\author{GPT 5.4}
+	\date{\today}
+	
+	\maketitle
+	
+	\tableofcontents
+	
+	\section{Scope and conventions}
+	
+	These implementation notes summarize the practical coding structure of matrix product state (MPS), matrix product operator (MPO), and finite-system DMRG algorithms for one-dimensional systems with open boundary conditions (OBC). The presentation is based on Schollw\"ock's review article, but rewritten with explicit implementation conventions suitable for numerical work.
+	
+	We assume throughout:
+	\begin{itemize}
+		\item open boundary conditions,
+		\item dense tensors without explicit quantum-number block sparsity,
+		\item finite-system algorithms,
+		\item NumPy-like row-major array storage.
+	\end{itemize}
+	
+	We use the following tensor conventions throughout:
+	\begin{itemize}
+		\item MPS tensor on site $i$:
+		\[
+		A^{[i]}_{\alpha_{i-1},\sigma_i,\alpha_i},
+		\]
+		with shape $(D_{i-1}, d_i, D_i)$.
+		\item MPO tensor on site $i$:
+		\[
+		W^{[i]}_{\beta_{i-1},\beta_i,\sigma_i,\sigma_i'},
+		\]
+		with shape $(\chi_{i-1}, \chi_i, d_i, d_i)$. We use the operator convention
+		\[
+		\hat W^{[i]}
+		=
+		\sum_{\sigma_i,\sigma_i'}
+		W^{[i]}_{\beta_{i-1},\beta_i,\sigma_i,\sigma_i'}
+		\ket{\sigma_i}\bra{\sigma_i'},
+		\]
+		so the first physical index is the ket index and the second is the bra index.
+		\item OBC dimensions:
+		\[
+		D_0 = D_L = 1,\qquad \chi_0 = \chi_L = 1.
+		\]
+	\end{itemize}
+	
+	Unless stated otherwise, all tensors should be stored as \texttt{complex128}.
+	
+	\section{Reshape conventions}
+	\label{sec:reshape}
+	
+	For numerical stability and reproducibility, reshape conventions must be fixed once and used everywhere.
+	
+	For a rank-3 MPS tensor
+	\[
+	T^{[i]}_{\alpha_{i-1},\sigma_i,\alpha_i},
+	\]
+	with storage shape $(D_{i-1},d_i,D_i)$, define the left-grouped matrix
+	\begin{equation}
+		T^{[i]}_{(\alpha_{i-1}\sigma_i),\alpha_i}
+		\in \mathbb{C}^{(D_{i-1}d_i)\times D_i},
+		\label{eq:left-group}
+	\end{equation}
+	and the right-grouped matrix
+	\begin{equation}
+		T^{[i]}_{\alpha_{i-1},(\sigma_i\alpha_i)}
+		\in \mathbb{C}^{D_{i-1}\times(d_iD_i)}.
+		\label{eq:right-group}
+	\end{equation}
+	
+	In row-major (C-order) storage, the flattening used in Eq.~\eqref{eq:left-group} is
+	\begin{equation}
+		r = \alpha_{i-1} d_i + \sigma_i,\qquad c = \alpha_i.
+	\end{equation}
+	
+	In NumPy:
+	\begin{verbatim}
+		M_left  = T.reshape((D_left * d, D_right), order='C')
+		M_right = T.reshape((D_left, d * D_right), order='C')
+	\end{verbatim}
+	
+	Typical inverse reshapes are
+	\begin{verbatim}
+		A  = U.reshape((D_left, d, D_new), order='C')
+		B  = Vh.reshape((D_new, d, D_right), order='C')
+	\end{verbatim}
+	
+	All QR/SVD steps must be consistent with these conventions, and the inverse reshape must use the same memory order and grouped-index convention.
+	
+	\section{Canonical forms}
+	
+	For fixed physical index $\sigma$, one may view $A^{[i]\sigma}$ as a matrix from the left bond to the right bond.
+	
+	Using index notation avoids ambiguity. A tensor $A^{[i]}$ is \emph{left-canonical} if
+	\begin{equation}
+		\sum_{\alpha_{i-1},\sigma_i}
+		A^{[i]}_{\alpha_{i-1},\sigma_i,\alpha_i}
+		A^{[i]*}_{\alpha_{i-1},\sigma_i,\alpha_i'}
+		=
+		\delta_{\alpha_i,\alpha_i'}.
+		\label{eq:left-canonical}
+	\end{equation}
+	Equivalently, if $A^{[i]}$ is reshaped as in Eq.~\eqref{eq:left-group}, then
+	\begin{equation}
+		\left(A^{[i]}_{(\alpha_{i-1}\sigma_i),\alpha_i}\right)^\dagger
+		A^{[i]}_{(\alpha_{i-1}\sigma_i),\alpha_i}
+		= \Id_{D_i}.
+	\end{equation}
+	
+	A tensor $B^{[i]}$ is \emph{right-canonical} if
+	\begin{equation}
+		\sum_{\sigma_i,\alpha_i}
+		B^{[i]}_{\alpha_{i-1},\sigma_i,\alpha_i}
+		B^{[i]*}_{\alpha_{i-1}',\sigma_i,\alpha_i}
+		=
+		\delta_{\alpha_{i-1},\alpha_{i-1}'}.
+		\label{eq:right-canonical}
+	\end{equation}
+	Equivalently, if $B^{[i]}$ is reshaped as in Eq.~\eqref{eq:right-group}, then
+	\begin{equation}
+		B^{[i]}_{\alpha_{i-1},(\sigma_i\alpha_i)}
+		\left(B^{[i]}_{\alpha_{i-1},(\sigma_i\alpha_i)}\right)^\dagger
+		= \Id_{D_{i-1}}.
+	\end{equation}
+	
+	A mixed-canonical state with orthogonality center at bond $i$ may be written as
+	\begin{equation}
+		\ket{\psi} =
+		\sum_{\alpha_i}
+		s^{[i]}_{\alpha_i}
+		\ket{\alpha_i}_L \ket{\alpha_i}_R,
+	\end{equation}
+	where $s^{[i]}_{\alpha_i}\ge 0$ are Schmidt singular values and the left/right Schmidt states are orthonormal. For a normalized state,
+	\[
+	\sum_{\alpha_i} \left(s^{[i]}_{\alpha_i}\right)^2 = 1.
+	\]
+	
+	\section{Canonicalization algorithms}
+	
+	\subsection{Left sweep by reduced QR}
+	
+	Given a general tensor $M^{[i]}$, reshape it as
+	\[
+	M^{[i]}_{(\alpha_{i-1}\sigma_i),\alpha_i}.
+	\]
+	Perform a reduced QR factorization
+	\begin{equation}
+		M^{[i]}_{(\alpha_{i-1}\sigma_i),\alpha_i} = Q R,
+	\end{equation}
+	where
+	\[
+	Q\in \mathbb{C}^{(D_{i-1}d_i)\times k},\qquad
+	R\in \mathbb{C}^{k\times D_i},\qquad
+	k=\min(D_{i-1}d_i,D_i).
+	\]
+	Reshape $Q$ into a left-canonical tensor
+	\[
+	A^{[i]}_{\alpha_{i-1},\sigma_i,\tilde\alpha_i},
+	\]
+	with new bond dimension $\tilde D_i = k$, then absorb $R$ into the next tensor:
+	\begin{equation}
+		M^{[i+1]}_{\tilde\alpha_i,\sigma_{i+1},\alpha_{i+1}}
+		\leftarrow
+		\sum_{\alpha_i}
+		R_{\tilde\alpha_i,\alpha_i}
+		M^{[i+1]}_{\alpha_i,\sigma_{i+1},\alpha_{i+1}}.
+		\label{eq:left-qr-absorb}
+	\end{equation}
+	
+	\begin{algorithm}[H]
+		\caption{LeftCanonicalizeByQR}
+		\begin{algorithmic}[1]
+			\Require MPS tensors $\{M^{[1]},\dots,M^{[L]}\}$
+			\Ensure Left-canonical tensors $\{A^{[1]},\dots,A^{[L-1]}\}$ and final center tensor $C^{[L]}$
+			\For{$i=1$ to $L-1$}
+			\State reshape $M^{[i]} \to \hat M$ with shape $(D_{i-1}d_i)\times D_i$
+			\State compute reduced QR: $\hat M = Q R$
+			\State reshape $Q \to A^{[i]}$ with shape $(D_{i-1},d_i,\tilde D_i)$
+			\State absorb $R$ into $M^{[i+1]}$ via Eq.~\eqref{eq:left-qr-absorb}
+			\EndFor
+			\State set $C^{[L]} \gets M^{[L]}$
+		\end{algorithmic}
+	\end{algorithm}
+	
+	\paragraph{Important practical note.}
+	For canonicalization, use \emph{reduced QR without pivoting}. Pivoted QR changes the bond basis by a permutation and is inconvenient unless the permutation is explicitly propagated into neighboring tensors.
+	
+	\subsection{Right sweep by reduced QR}
+	
+	To right-canonicalize site $i$, reshape
+	\[
+	M^{[i]}_{\alpha_{i-1},(\sigma_i\alpha_i)}
+	\in \mathbb{C}^{D_{i-1}\times(d_iD_i)}.
+	\]
+	Compute a reduced QR factorization of the Hermitian transpose:
+	\begin{equation}
+		\left(M^{[i]}_{\alpha_{i-1},(\sigma_i\alpha_i)}\right)^\dagger = Q R,
+	\end{equation}
+	with
+	\[
+	Q\in\mathbb{C}^{(d_iD_i)\times k},\qquad
+	R\in\mathbb{C}^{k\times D_{i-1}},\qquad
+	k=\min(d_iD_i,D_{i-1}).
+	\]
+	Then
+	\begin{equation}
+		M^{[i]} = R^\dagger Q^\dagger.
+	\end{equation}
+	Reshape $Q^\dagger$ into a right-canonical tensor
+	\[
+	B^{[i]}_{\tilde\alpha_{i-1},\sigma_i,\alpha_i},
+	\]
+	with new bond dimension $\tilde D_{i-1}=k$, and absorb $R^\dagger$ into site $i-1$:
+	\begin{equation}
+		M^{[i-1]}_{\alpha_{i-2},\sigma_{i-1},\tilde\alpha_{i-1}}
+		\leftarrow
+		\sum_{\alpha_{i-1}}
+		M^{[i-1]}_{\alpha_{i-2},\sigma_{i-1},\alpha_{i-1}}
+		(R^\dagger)_{\alpha_{i-1},\tilde\alpha_{i-1}}.
+	\end{equation}
+	
+	\section{SVD truncation}
+	
+	Given a matrix $X\in\mathbb{C}^{m\times n}$ with reduced SVD
+	\begin{equation}
+		X = U S V^\dagger,
+	\end{equation}
+	where
+	\[
+	U\in\mathbb{C}^{m\times r},\quad
+	S=\mathrm{diag}(s_1,\dots,s_r),\quad
+	V^\dagger\in\mathbb{C}^{r\times n},\quad
+	s_1\ge s_2\ge \cdots \ge s_r\ge 0,
+	\]
+	truncate to bond dimension $D$ by keeping the $D$ largest singular values:
+	\begin{equation}
+		X \approx U_D S_D V_D^\dagger.
+	\end{equation}
+	
+	The discarded weight is
+	\begin{equation}
+		\eta = \sum_{j>D} s_j^2.
+	\end{equation}
+	If the state is normalized, $\eta$ is the squared 2-norm of the discarded Schmidt tail.
+	
+	\begin{algorithm}[H]
+		\caption{TruncateBySVD}
+		\begin{algorithmic}[1]
+			\Require matrix $X$, max bond dimension $D_{\max}$, tolerance $\eps$
+			\Ensure truncated $U_D,S_D,V_D^\dagger$, discarded weight $\eta$
+			\State compute reduced SVD: $X = U S V^\dagger$
+			\State let $D = \min\{D_{\max},\#(s_j > \eps)\}$
+			\If{$D=0$}
+			\State $D\gets 1$
+			\EndIf
+			\State keep first $D$ singular values/vectors
+			\State $\eta \gets \sum_{j>D} s_j^2$
+		\end{algorithmic}
+	\end{algorithm}
+	
+	\paragraph{Practical note.}
+	In production codes, the retained bond dimension is often chosen using both a hard cap $D_{\max}$ and a discarded-weight tolerance, rather than only a singular-value threshold. A robust rule is to retain the smallest $D\le D_{\max}$ such that the discarded weight is below a prescribed tolerance, while always keeping at least one singular value.
+	
+	\section{Heisenberg MPO}
+	
+	For the spin-$1/2$ nearest-neighbor XXZ chain with field,
+	\begin{equation}
+		H =
+		\sum_{i=1}^{L-1}
+		\left[
+		\frac{J}{2}\left(S_i^+ S_{i+1}^- + S_i^- S_{i+1}^+\right)
+		+
+		J_z S_i^z S_{i+1}^z
+		\right]
+		-
+		h\sum_{i=1}^L S_i^z,
+	\end{equation}
+	a standard OBC MPO with bond dimension $\chi=5$ is
+	\begin{equation}
+		\hat W_{\mathrm{bulk}} =
+		\begin{pmatrix}
+			\Id & 0 & 0 & 0 & 0 \\
+			S^+ & 0 & 0 & 0 & 0 \\
+			S^- & 0 & 0 & 0 & 0 \\
+			S^z & 0 & 0 & 0 & 0 \\
+			-hS^z & \frac{J}{2}S^- & \frac{J}{2}S^+ & J_z S^z & \Id
+		\end{pmatrix}.
+	\end{equation}
+	
+	Here $\hat W_{\mathrm{bulk}}$ is an operator-valued matrix. The tensor components $W^{[i]}_{\beta_{i-1},\beta_i,\sigma,\sigma'}$ are obtained by expanding each operator entry in the local basis:
+	\[
+	(\hat O)_{\sigma,\sigma'} = \bra{\sigma}\hat O\ket{\sigma'}.
+	\]
+	
+	For the local spin-$1/2$ basis $\{\ket{\uparrow},\ket{\downarrow}\}$, use
+	\[
+	S^+ = \begin{pmatrix}0&1\\0&0\end{pmatrix},\qquad
+	S^- = \begin{pmatrix}0&0\\1&0\end{pmatrix},\qquad
+	S^z = \frac12\begin{pmatrix}1&0\\0&-1\end{pmatrix}.
+	\]
+	
+	For OBC, choose:
+	\begin{equation}
+		\hat W^{[1]} =
+		\begin{pmatrix}
+			-hS^z & \frac{J}{2}S^- & \frac{J}{2}S^+ & J_z S^z & \Id
+		\end{pmatrix},
+	\end{equation}
+	\begin{equation}
+		\hat W^{[L]} =
+		\begin{pmatrix}
+			\Id \\ S^+ \\ S^- \\ S^z \\ -hS^z
+		\end{pmatrix},
+	\end{equation}
+	and use $\hat W_{\mathrm{bulk}}$ on all intermediate sites, with the chosen lower-triangular convention.
+	
+	In code, this means:
+	\begin{itemize}
+		\item the left boundary tensor has shape $(1,5,d,d)$ and is the row vector selecting the bottom row of the bulk operator-valued MPO,
+		\item the right boundary tensor has shape $(5,1,d,d)$ and is the column vector selecting the leftmost column of the bulk operator-valued MPO.
+	\end{itemize}
+	
+	\paragraph{Recommended unit test.}
+	For $L=2,3,4$, contract the MPO to a dense Hamiltonian and compare entrywise against the Hamiltonian constructed directly by Kronecker products of the local operators.
+	
+	\section{AKLT Hamiltonian MPO}
+	
+	For the spin-1 AKLT chain, the Hamiltonian is
+	\begin{equation}
+		H_{\mathrm{AKLT}}
+		=
+		\sum_{i=1}^{L-1}
+		\left[
+		\mathbf S_i\cdot \mathbf S_{i+1}
+		+
+		\frac13\left(\mathbf S_i\cdot \mathbf S_{i+1}\right)^2
+		\right].
+		\label{eq:aklt-hamiltonian}
+	\end{equation}
+	This is the Hamiltonian whose exact ground state is the AKLT MPS given later in these notes.
+	
+	\subsection{Local spin-1 operators}
+	
+	In the local basis
+	\[
+	\{\ket{+1},\ket{0},\ket{-1}\},
+	\]
+	use the standard spin-1 matrices
+	\begin{equation}
+		S^z
+		=
+		\begin{pmatrix}
+			1 & 0 & 0 \\
+			0 & 0 & 0 \\
+			0 & 0 & -1
+		\end{pmatrix},
+	\end{equation}
+	\begin{equation}
+		S^+
+		=
+		\sqrt{2}
+		\begin{pmatrix}
+			0 & 1 & 0 \\
+			0 & 0 & 1 \\
+			0 & 0 & 0
+		\end{pmatrix},
+		\qquad
+		S^-
+		=
+		\sqrt{2}
+		\begin{pmatrix}
+			0 & 0 & 0 \\
+			1 & 0 & 0 \\
+			0 & 1 & 0
+		\end{pmatrix}.
+	\end{equation}
+	
+	Define the bilinear bond operator
+	\begin{equation}
+		X_{i,i+1}
+		\equiv
+		\mathbf S_i\cdot \mathbf S_{i+1}
+		=
+		\frac12\left(S_i^+S_{i+1}^- + S_i^-S_{i+1}^+\right)
+		+
+		S_i^z S_{i+1}^z.
+		\label{eq:aklt-bilinear-bond}
+	\end{equation}
+	Then
+	\begin{equation}
+		h_{i,i+1}^{\mathrm{AKLT}}
+		=
+		X_{i,i+1}
+		+
+		\frac13 X_{i,i+1}^2,
+		\label{eq:aklt-local-bond}
+	\end{equation}
+	and
+	\[
+	H_{\mathrm{AKLT}} = \sum_{i=1}^{L-1} h_{i,i+1}^{\mathrm{AKLT}}.
+	\]
+	
+	\subsection{Factorized form of the bond interaction}
+	
+	Introduce the operator lists
+	\begin{equation}
+		O_1 = \frac{1}{\sqrt{2}}S^+,\qquad
+		O_2 = \frac{1}{\sqrt{2}}S^-,\qquad
+		O_3 = S^z,
+	\end{equation}
+	and
+	\begin{equation}
+		\bar O_1 = \frac{1}{\sqrt{2}}S^-,\qquad
+		\bar O_2 = \frac{1}{\sqrt{2}}S^+,\qquad
+		\bar O_3 = S^z.
+	\end{equation}
+	Then Eq.~\eqref{eq:aklt-bilinear-bond} becomes
+	\begin{equation}
+		X_{i,i+1}
+		=
+		\sum_{a=1}^3 O_a^{[i]} \bar O_a^{[i+1]}.
+		\label{eq:X-factorized}
+	\end{equation}
+	Therefore
+	\begin{equation}
+		X_{i,i+1}^2
+		=
+		\sum_{a=1}^3 \sum_{b=1}^3
+		\left(O_a O_b\right)^{[i]}
+		\left(\bar O_a \bar O_b\right)^{[i+1]}.
+		\label{eq:X2-factorized}
+	\end{equation}
+	Substituting Eqs.~\eqref{eq:X-factorized} and \eqref{eq:X2-factorized} into Eq.~\eqref{eq:aklt-local-bond}, we obtain
+	\begin{equation}
+		h_{i,i+1}^{\mathrm{AKLT}}
+		=
+		\sum_{a=1}^3 O_a^{[i]} \bar O_a^{[i+1]}
+		+
+		\frac13
+		\sum_{a=1}^3 \sum_{b=1}^3
+		\left(O_a O_b\right)^{[i]}
+		\left(\bar O_a \bar O_b\right)^{[i+1]}.
+		\label{eq:aklt-factorized-bond}
+	\end{equation}
+	
+	\subsection{Exact MPO construction}
+	
+	Equation~\eqref{eq:aklt-factorized-bond} is an exact nearest-neighbor MPO. A convenient MPO has bond dimension
+	\[
+	\chi = 1 + 3 + 9 + 1 = 14.
+	\]
+	This slightly larger bond dimension is chosen because it leads to a completely explicit implementation without block-index ambiguities.
+	
+	\paragraph{Explicit MPO bond-index convention.}
+	For implementation, the MPO bond index is ordered as follows:
+	\begin{equation}
+		\beta = 0
+		\qquad \text{start channel},
+	\end{equation}
+	\begin{equation}
+		\beta = 1,2,3
+		\qquad \leftrightarrow \qquad
+		a=1,2,3,
+	\end{equation}
+	\begin{equation}
+		\beta = 4,\dots,12
+		\qquad \leftrightarrow \qquad
+		(a,b)\in
+		\{(1,1),(1,2),(1,3),(2,1),(2,2),(2,3),(3,1),(3,2),(3,3)\},
+		\label{eq:aklt-lexicographic-order}
+	\end{equation}
+	taken in lexicographic order, and
+	\begin{equation}
+		\beta = 13
+		\qquad \text{terminal / identity-propagation channel}.
+	\end{equation}
+	This convention is used consistently in the bulk tensor and in both boundary tensors.
+	
+	Define
+	\begin{equation}
+		\bm O
+		=
+		\begin{pmatrix}
+			O_1 & O_2 & O_3
+		\end{pmatrix},
+		\qquad
+		\bar{\bm O}
+		=
+		\begin{pmatrix}
+			\bar O_1 \\ \bar O_2 \\ \bar O_3
+		\end{pmatrix},
+	\end{equation}
+	\begin{equation}
+		\bm O^{(2)}
+		=
+		\begin{pmatrix}
+			O_1 O_1 &
+			O_1 O_2 &
+			O_1 O_3 &
+			O_2 O_1 &
+			O_2 O_2 &
+			O_2 O_3 &
+			O_3 O_1 &
+			O_3 O_2 &
+			O_3 O_3
+		\end{pmatrix},
+	\end{equation}
+	and
+	\begin{equation}
+		\bar{\bm O}^{(2)}
+		=
+		\begin{pmatrix}
+			\bar O_1 \bar O_1 \\
+			\bar O_1 \bar O_2 \\
+			\bar O_1 \bar O_3 \\
+			\bar O_2 \bar O_1 \\
+			\bar O_2 \bar O_2 \\
+			\bar O_2 \bar O_3 \\
+			\bar O_3 \bar O_1 \\
+			\bar O_3 \bar O_2 \\
+			\bar O_3 \bar O_3
+		\end{pmatrix}.
+	\end{equation}
+	The ordering of the $9$ entries in $\bm O^{(2)}$ and $\bar{\bm O}^{(2)}$ is the same lexicographic ordering defined in Eq.~\eqref{eq:aklt-lexicographic-order}.
+	
+	A bulk operator-valued MPO tensor is then
+	\begin{equation}
+		\hat W_{\mathrm{AKLT,bulk}}
+		=
+		\begin{pmatrix}
+			\Id & \bm O & \frac13 \bm O^{(2)} & 0 \\
+			0 & 0 & 0 & \bar{\bm O} \\
+			0 & 0 & 0 & \bar{\bm O}^{(2)} \\
+			0 & 0 & 0 & \Id
+		\end{pmatrix},
+		\label{eq:aklt-mpo-block}
+	\end{equation}
+	where the block sizes are $1|3|9|1$.
+	
+	In words:
+	\begin{itemize}
+		\item the channel $0\to a$ with $a=1,2,3$ starts the bilinear term via $O_a$,
+		\item the channel $0\to(a,b)$ starts the biquadratic term via $\frac13 O_a O_b$,
+		\item the channel $a\to 13$ finishes the bilinear term via $\bar O_a$,
+		\item the channel $(a,b)\to 13$ finishes the biquadratic term via $\bar O_a \bar O_b$,
+		\item the channel $13\to 13$ propagates the identity after a term has been completed.
+	\end{itemize}
+	With the index convention above, contracting the MPO generates exactly
+	\[
+	\sum_{i=1}^{L-1} h_{i,i+1}^{\mathrm{AKLT}}
+	=
+	\sum_{i=1}^{L-1}
+	\left[
+	\mathbf S_i\cdot \mathbf S_{i+1}
+	+
+	\frac13\left(\mathbf S_i\cdot \mathbf S_{i+1}\right)^2
+	\right].
+	\]
+	
+	For OBC, use boundary tensors
+	\begin{equation}
+		\hat W_{\mathrm{AKLT}}^{[1]}
+		=
+		\begin{pmatrix}
+			\Id & \bm O & \frac13 \bm O^{(2)} & 0
+		\end{pmatrix},
+		\label{eq:aklt-left-boundary}
+	\end{equation}
+	and
+	\begin{equation}
+		\hat W_{\mathrm{AKLT}}^{[L]}
+		=
+		\begin{pmatrix}
+			0 \\ \bar{\bm O} \\ \bar{\bm O}^{(2)} \\ \Id
+		\end{pmatrix}.
+		\label{eq:aklt-right-boundary}
+	\end{equation}
+	Thus, in the tensor convention of these notes,
+	\begin{itemize}
+		\item the left boundary tensor has shape $(1,14,3,3)$,
+		\item each bulk tensor has shape $(14,14,3,3)$,
+		\item the right boundary tensor has shape $(14,1,3,3)$.
+	\end{itemize}
+	The MPO physical indices are ordered as
+	\[
+	W^{[i]}_{\beta_{i-1},\beta_i,\sigma,\sigma'},
+	\]
+	with $\sigma$ the ket index and $\sigma'$ the bra index, exactly as in the Heisenberg MPO section.
+	
+	\subsection{Tensor components}
+	
+	As in the Heisenberg MPO section, the operator-valued entries are converted into numerical MPO tensor components by
+	\begin{equation}
+		W^{[i]}_{\beta_{i-1},\beta_i,\sigma,\sigma'}
+		=
+		\bra{\sigma}
+		\hat W^{[i]}_{\beta_{i-1},\beta_i}
+		\ket{\sigma'}.
+	\end{equation}
+	Here $\sigma,\sigma'\in\{+1,0,-1\}$ and the local physical dimension is $d=3$.
+	
+	\subsection{Implementation remarks}
+	
+	A transparent implementation strategy is:
+	\begin{enumerate}
+		\item construct the local spin-1 matrices $S^+,S^-,S^z$,
+		\item define $O_a$ and $\bar O_a$,
+		\item build the $9$ operators $O_a O_b$,
+		\item build the $9$ operators $\bar O_a\bar O_b$,
+		\item assemble the operator-valued boundary and bulk MPOs from
+		Eqs.~\eqref{eq:aklt-mpo-block}, \eqref{eq:aklt-left-boundary}, and \eqref{eq:aklt-right-boundary},
+		\item expand each operator entry into local matrix elements.
+	\end{enumerate}
+	
+	\paragraph{Recommended unit tests.}
+	For $L=2,3,4$:
+	\begin{itemize}
+		\item contract the MPO to a dense matrix,
+		\item compare against the Hamiltonian built directly from Eq.~\eqref{eq:aklt-hamiltonian},
+		\item verify that the AKLT MPS given later in these notes has energy
+		\[
+		E_0 = -\frac{2}{3}(L-1)
+		\]
+		for open chains, up to numerical precision.
+	\end{itemize}
+	
+	\section{MPO environments}
+	\label{sec:env}
+	
+	For a center at site $i$, let $L^{[i]}$ denote the contraction of sites
+	$1,\dots,i-1$ into a left environment, and let $R^{[i]}$ denote the contraction
+	of sites $i+1,\dots,L$ into a right environment.
+	
+	We store the left and right environments as tensors
+	\[
+	L^{[i]}_{\beta_{i-1}}(\alpha_{i-1},\alpha'_{i-1}),
+	\qquad
+	R^{[i]}_{\beta_i}(\alpha_i,\alpha'_i),
+	\]
+	with array shapes
+	\[
+	L^{[i]} \in \mathbb{C}^{\chi_{i-1}\times D_{i-1}\times D_{i-1}},
+	\qquad
+	R^{[i]} \in \mathbb{C}^{\chi_i\times D_i\times D_i}.
+	\]
+	
+	\subsection{Left environment update}
+	
+	Suppose sites $1,\dots,i-1$ are represented by left-canonical tensors. Then the
+	left environment is updated recursively by
+	\begin{equation}
+		L^{[i]}_{\beta_{i-1}}(\alpha_{i-1},\alpha'_{i-1})
+		=
+		\sum_{\substack{
+				\alpha_{i-2},\alpha'_{i-2}\\
+				\sigma,\sigma'\\
+				\beta_{i-2}
+		}}
+		L^{[i-1]}_{\beta_{i-2}}(\alpha_{i-2},\alpha'_{i-2})
+		A^{[i-1]}_{\alpha_{i-2},\sigma,\alpha_{i-1}}
+		W^{[i-1]}_{\beta_{i-2},\beta_{i-1},\sigma,\sigma'}
+		A^{[i-1]*}_{\alpha'_{i-2},\sigma',\alpha'_{i-1}}.
+		\label{eq:left-env-consistent-rewritten}
+	\end{equation}
+	
+	With array conventions
+	\begin{itemize}
+		\item \texttt{Lold[b,x,y]},
+		\item \texttt{A[x,s,a]},
+		\item \texttt{W[b,B,s,t]},
+	\end{itemize}
+	the validated NumPy implementation is
+	\begin{verbatim}
+		Lnew = np.einsum('bxy,xsa,bBst,ytc->Bac', Lold, A, W, A.conj())
+	\end{verbatim}
+	
+	\subsection{Right environment update}
+	
+	Suppose sites $i+1,\dots,L$ are represented by right-canonical tensors. Then the
+	right environment is updated recursively by
+	\begin{equation}
+		R^{[i]}_{\beta_i}(\alpha_i,\alpha'_i)
+		=
+		\sum_{\substack{
+				\alpha_{i+1},\alpha'_{i+1}\\
+				\sigma,\sigma'\\
+				\beta_{i+1}
+		}}
+		B^{[i+1]}_{\alpha_i,\sigma,\alpha_{i+1}}
+		W^{[i+1]}_{\beta_i,\beta_{i+1},\sigma,\sigma'}
+		R^{[i+1]}_{\beta_{i+1}}(\alpha_{i+1},\alpha'_{i+1})
+		B^{[i+1]*}_{\alpha'_i,\sigma',\alpha'_{i+1}}.
+		\label{eq:right-env-consistent-rewritten}
+	\end{equation}
+	
+	With array conventions
+	\begin{itemize}
+		\item \texttt{Rold[B,a,c]},
+		\item \texttt{B[x,s,a]},
+		\item \texttt{W[b,B,s,t]},
+	\end{itemize}
+	the validated NumPy implementation is
+	\begin{verbatim}
+		Rnew = np.einsum('xsa,bBst,Bac,ytc->bxy', B, W, Rold, B.conj())
+	\end{verbatim}
+	
+	\subsection{Boundary initialization}
+	
+	For open boundary conditions,
+	\begin{equation}
+		L^{[1]}_{\beta_0}(1,1)=\delta_{\beta_0,1},
+		\qquad
+		R^{[L]}_{\beta_L}(1,1)=\delta_{\beta_L,1},
+	\end{equation}
+	with
+	\[
+	D_0=D_L=\chi_0=\chi_L=1.
+	\]
+	
+	In code, these are simply
+	\begin{verbatim}
+		L = np.zeros((1,1,1), dtype=np.complex128); L[0,0,0] = 1
+		R = np.zeros((1,1,1), dtype=np.complex128); R[0,0,0] = 1
+	\end{verbatim}
+	
+	\subsection{Interpretation and convention warning}
+	
+	The update formulas above define the \emph{stored} left and right environment tensors.
+	However, for the tensor, reshape, and MPO conventions used in these notes, the stored left
+	environment does not enter the local effective-Hamiltonian action with the same bond-index
+	order as it is stored.
+	
+	More precisely, if the stored left environment is represented in code as
+	\[
+	\texttt{L[b,x,y]},
+	\]
+	then in the validated one-site and two-site local contractions it must be used as
+	\[
+	\texttt{L[b,y,x]}.
+	\]
+	
+	This point is easy to miss. A local operator built from environments can remain Hermitian
+	even when this ordering is wrong, while still failing to agree with the exact projected
+	operator
+	\[
+	P^\dagger H P.
+	\]
+	Therefore one should distinguish carefully between
+	\begin{itemize}
+		\item the recursion defining the stored environments, and
+		\item the way those stored tensors are inserted into the local effective-Hamiltonian action.
+	\end{itemize}
+	
+	\subsection{Practical recommendation}
+	
+	The left and right environment update routines should be tested independently against
+	brute-force contractions on very small systems. After that, the resulting one-site and
+	two-site environment-based local operators should be compared explicitly against dense
+	projected references. In practice, this second test is the decisive one: it verifies not
+	only that the environments are built recursively, but also that they are inserted into the
+	local effective Hamiltonian with the correct index ordering.
+	
+	\section{One-site effective Hamiltonian}
+	
+	Let the center tensor at site $i$ be
+	\[
+	M^{[i]}_{\alpha_{i-1},\sigma_i,\alpha_i}.
+	\]
+	The local variational problem is
+	\begin{equation}
+		\mathcal{H}_{\mathrm{eff}}\,v = E v,
+	\end{equation}
+	where $v$ denotes the vectorized form of the center tensor.
+	
+	\paragraph{General structure.}
+	The one-site effective Hamiltonian is obtained by contracting the full MPO with all
+	MPS tensors outside site $i$, leaving only the local tensor $M^{[i]}$ open.
+	In principle one may write this object symbolically as a contraction of a left environment,
+	one local MPO tensor, and a right environment. In practice, however, the safest way to
+	specify the operator---and the one that is directly useful for coding---is through its
+	validated matrix-free contraction sequence.
+	
+	\paragraph{Convention-sensitive point.}
+	For the conventions used in these notes, the stored left environment tensor does not enter
+	the local action with the same MPS-bond index order as it is stored. If the stored array is
+	\texttt{L[b,x,y]}, then the validated local contraction uses it as \texttt{L[b,y,x]}.
+	Equivalently, the left environment enters the one-site effective Hamiltonian with its two
+	MPS-bond indices interchanged relative to the most naive symbolic reading.
+	
+	\subsection{Validated matrix-free action}
+	
+	Let
+	\[
+	L^{[i]}_{\beta_{i-1}}(\alpha_{i-1},\alpha'_{i-1})
+	\]
+	be the stored left environment and
+	\[
+	R^{[i]}_{\beta_i}(\alpha_i,\alpha'_i)
+	\]
+	the stored right environment. Then the validated one-site matrix-free action is
+	\begin{align}
+		X_{\beta_{i-1},\alpha_{i-1},\sigma_i,\alpha_i'}
+		&=
+		\sum_{\alpha_{i-1}'}
+		L^{[i]}_{\beta_{i-1}}(\alpha_{i-1}',\alpha_{i-1})
+		M^{[i]}_{\alpha_{i-1}',\sigma_i,\alpha_i'},
+		\label{eq:one-site-step1}
+		\\
+		Y_{\beta_i,\alpha_{i-1},\sigma_i',\alpha_i'}
+		&=
+		\sum_{\beta_{i-1},\sigma_i}
+		W^{[i]}_{\beta_{i-1},\beta_i,\sigma_i',\sigma_i}
+		X_{\beta_{i-1},\alpha_{i-1},\sigma_i,\alpha_i'},
+		\label{eq:one-site-step2}
+		\\
+		(\mathcal{H}_{\mathrm{eff}}M)_{\alpha_{i-1},\sigma_i',\alpha_i}
+		&=
+		\sum_{\beta_i,\alpha_i'}
+		Y_{\beta_i,\alpha_{i-1},\sigma_i',\alpha_i'}
+		R^{[i]}_{\beta_i}(\alpha_i',\alpha_i).
+		\label{eq:one-site-step3}
+	\end{align}
+	
+	This is the convention-correct form for the one-site effective Hamiltonian in the present notes.
+	In particular, the first step involves
+	\[
+	L^{[i]}_{\beta_{i-1}}(\alpha_{i-1}',\alpha_{i-1}),
+	\]
+	not
+	\[
+	L^{[i]}_{\beta_{i-1}}(\alpha_{i-1},\alpha_{i-1}').
+	\]
+	
+	\subsection{Validated NumPy implementation}
+	
+	With arrays
+	\begin{itemize}
+		\item \texttt{L[b,x,y]} for the stored left environment,
+		\item \texttt{M[y,s,z]} for the local center tensor,
+		\item \texttt{W[b,B,s,t]} for the MPO tensor,
+		\item \texttt{R[B,z,a]} for the stored right environment,
+	\end{itemize}
+	the validated implementation is
+	\begin{verbatim}
+		X  = np.einsum('byx,ysz->bxsz', L, M)
+		Y  = np.einsum('bBst,bxsz->Bxtz', W, X)
+		HM = np.einsum('Bxtz,Bza->xta', Y, R)
+	\end{verbatim}
+	
+	Here \texttt{HM} has the same shape as \texttt{M}. The use of \texttt{'byx'} rather than
+	\texttt{'bxy'} in the first contraction is essential.
+	
+	\paragraph{Interpretation of physical indices.}
+	The MPO tensor is stored as
+	\[
+	W^{[i]}_{\beta_{i-1},\beta_i,\sigma,\sigma'},
+	\]
+	with the first physical index $\sigma$ the ket/output index and the second physical index
+	$\sigma'$ the bra/input index. The contraction in Eq.~\eqref{eq:one-site-step2} is the
+	validated routing consistent with this convention and with the environment storage described above.
+	
+	\subsection{Vectorization and local eigensolver interface}
+	
+	If
+	\[
+	M^{[i]} \in \mathbb{C}^{D_{i-1}\times d_i \times D_i},
+	\]
+	then the local vector-space dimension is
+	\[
+	N_{\mathrm{loc}} = D_{i-1} d_i D_i.
+	\]
+	The eigensolver vector
+	\[
+	v \in \mathbb{C}^{N_{\mathrm{loc}}}
+	\]
+	is identified with the tensor by
+	\[
+	M^{[i]} = \mathrm{reshape}(v,\,(D_{i-1},d_i,D_i)),
+	\]
+	using the fixed C-order convention of Section~\ref{sec:reshape}. After applying the local
+	effective Hamiltonian, the output tensor is flattened back into a vector with the same convention.
+	
+	A practical wrapper is
+	\begin{verbatim}
+		from scipy.sparse.linalg import LinearOperator, eigsh
+		
+		def heff_one_site_matvec(v, L, W, R, Dl, d, Dr):
+		M = v.reshape((Dl, d, Dr), order='C')
+		X  = np.einsum('byx,ysz->bxsz', L, M)
+		Y  = np.einsum('bBst,bxsz->Bxtz', W, X)
+		HM = np.einsum('Bxtz,Bza->xta', Y, R)
+		return HM.reshape(Dl * d * Dr, order='C')
+		
+		Nloc = Dl * d * Dr
+		Heff = LinearOperator(
+		shape=(Nloc, Nloc),
+		matvec=lambda v: heff_one_site_matvec(v, L, W, R, Dl, d, Dr),
+		dtype=np.complex128
+		)
+	\end{verbatim}
+	
+	The eigensolver should be initialized with the current local tensor:
+	\begin{verbatim}
+		v0 = M_current.reshape(Nloc, order='C')
+	\end{verbatim}
+	
+	\subsection{Validation strategy}
+	
+	For small systems, one should explicitly build the dense projected operator
+	\[
+	P^\dagger H P
+	\]
+	for the one-site center and compare it against the dense matrix obtained by repeated
+	application of the matrix-free routine above.
+	
+	\paragraph{Important warning.}
+	Hermiticity of the environment-built local operator is necessary but not sufficient.
+	With the conventions of these notes, a naive contraction using the stored left environment
+	without the required index interchange can still produce a Hermitian operator, while failing
+	to agree with the true projected operator \(P^\dagger H P\). Therefore the contraction
+	sequence in Eqs.~\eqref{eq:one-site-step1}--\eqref{eq:one-site-step3} should be treated as
+	the authoritative implementation for the present conventions.
+	
+	\section{Two-site effective Hamiltonian}
+	
+	At bond $(i,i+1)$, define the two-site center tensor
+	\begin{equation}
+		\Theta^{[i,i+1]}_{\alpha_{i-1},\sigma_i,\sigma_{i+1},\alpha_{i+1}},
+		\label{eq:theta-def}
+	\end{equation}
+	so that
+	\begin{equation}
+		\ket{\psi}
+		=
+		\sum_{\alpha_{i-1},\sigma_i,\sigma_{i+1},\alpha_{i+1}}
+		\Theta^{[i,i+1]}_{\alpha_{i-1},\sigma_i,\sigma_{i+1},\alpha_{i+1}}
+		\ket{\alpha_{i-1}}_L \ket{\sigma_i}\ket{\sigma_{i+1}} \ket{\alpha_{i+1}}_R.
+		\label{eq:two-site-state}
+	\end{equation}
+	
+	The two-site local variational problem is the direct analogue of the standard
+	two-site DMRG superblock problem, but expressed entirely in terms of MPS/MPO
+	environments and a matrix-free local action.
+	
+	\paragraph{General structure.}
+	In principle, the effective Hamiltonian at bond $(i,i+1)$ may be written symbolically
+	as a contraction of
+	\begin{itemize}
+		\item a left environment built from sites $1,\dots,i-1$,
+		\item the two local MPO tensors at sites $i$ and $i+1$,
+		\item a right environment built from sites $i+2,\dots,L$.
+	\end{itemize}
+	In practice, however, the most reliable specification is again the validated contraction
+	sequence itself.
+	
+	\paragraph{Convention-sensitive point.}
+	For the conventions used in these notes, two implementation details are essential:
+	\begin{enumerate}
+		\item the stored left environment enters the local action with its two MPS-bond
+		indices interchanged,
+		\item the local MPO tensors must be contracted with the physical-index routing that
+		is consistent with the validated implementation below.
+	\end{enumerate}
+	These points are easy to get wrong, and more naive contractions can produce Hermitian
+	local operators that nevertheless fail to agree with the true projected operator
+	\[
+	P^\dagger H P.
+	\]
+	
+	\subsection{Validated matrix-free action}
+	
+	Let
+	\[
+	L^{[i]}_{\beta_{i-1}}(\alpha_{i-1},\alpha'_{i-1})
+	\]
+	be the stored left environment built from sites $1,\dots,i-1$, and let
+	\[
+	R^{[i+1]}_{\beta_{i+1}}(\alpha_{i+1},\alpha'_{i+1})
+	\]
+	be the stored right environment built from sites $i+2,\dots,L$.
+	
+	The validated matrix-free two-site action is
+	\begin{align}
+		X_{\beta_{i-1},\alpha_{i-1},\sigma_i,\sigma_{i+1},\alpha_{i+1}'}
+		&=
+		\sum_{\alpha_{i-1}'}
+		L^{[i]}_{\beta_{i-1}}(\alpha_{i-1}',\alpha_{i-1})
+		\Theta_{\alpha_{i-1}',\sigma_i,\sigma_{i+1},\alpha_{i+1}'},
+		\label{eq:two-site-step1}
+		\\
+		Y_{\beta_i,\alpha_{i-1},\sigma_i',\sigma_{i+1},\alpha_{i+1}'}
+		&=
+		\sum_{\beta_{i-1},\sigma_i}
+		W^{[i]}_{\beta_{i-1},\beta_i,\sigma_i,\sigma_i'}
+		X_{\beta_{i-1},\alpha_{i-1},\sigma_i,\sigma_{i+1},\alpha_{i+1}'},
+		\label{eq:two-site-step2}
+		\\
+		Z_{\beta_{i+1},\alpha_{i-1},\sigma_i',\sigma_{i+1}',\alpha_{i+1}'}
+		&=
+		\sum_{\beta_i,\sigma_{i+1}}
+		W^{[i+1]}_{\beta_i,\beta_{i+1},\sigma_{i+1},\sigma_{i+1}'}
+		Y_{\beta_i,\alpha_{i-1},\sigma_i',\sigma_{i+1},\alpha_{i+1}'},
+		\label{eq:two-site-step3}
+		\\
+		(\mathcal{H}_{\mathrm{eff}}\Theta)_{\alpha_{i-1},\sigma_i',\sigma_{i+1}',\alpha_{i+1}}
+		&=
+		\sum_{\beta_{i+1},\alpha_{i+1}'}
+		Z_{\beta_{i+1},\alpha_{i-1},\sigma_i',\sigma_{i+1}',\alpha_{i+1}'}
+		R^{[i+1]}_{\beta_{i+1}}(\alpha_{i+1}',\alpha_{i+1}).
+		\label{eq:two-site-step4}
+	\end{align}
+	
+	As in the one-site case, the first line uses
+	\[
+	L^{[i]}_{\beta_{i-1}}(\alpha_{i-1}',\alpha_{i-1})
+	\]
+	rather than
+	\[
+	L^{[i]}_{\beta_{i-1}}(\alpha_{i-1},\alpha_{i-1}').
+	\]
+	
+	\subsection{Validated NumPy implementation}
+	
+	Let the two-site tensor be stored as
+	\[
+	\Theta[\alpha_{i-1},\sigma_i,\sigma_{i+1},\alpha_{i+1}],
+	\]
+	with shape
+	\[
+	(D_{i-1},d_i,d_{i+1},D_{i+1}).
+	\]
+	
+	With arrays
+	\begin{itemize}
+		\item \texttt{L[b,x,y]} for the stored left environment,
+		\item \texttt{Theta[y,u,v,z]} for the input two-site tensor,
+		\item \texttt{W1[b,B,u,s]} for the MPO tensor on site $i$,
+		\item \texttt{W2[B,C,v,t]} for the MPO tensor on site $i+1$,
+		\item \texttt{R[C,z,a]} for the stored right environment,
+	\end{itemize}
+	the validated matrix-free contraction is
+	\begin{verbatim}
+		X  = np.einsum('byx,yuvz->bxuvz', L, Theta)
+		Y  = np.einsum('bBus,bxuvz->Bxsvz', W1, X)
+		Z  = np.einsum('BCvt,Bxsvz->Cxstz', W2, Y)
+		HT = np.einsum('Cxstz,Cza->xsta', Z, R)
+	\end{verbatim}
+	
+	The output tensor \texttt{HT[x,s,t,a]} has the same shape as \texttt{Theta}.
+	
+	\paragraph{Interpretation of physical indices.}
+	The MPO tensors are stored as
+	\[
+	W^{[i]}_{\beta_{i-1},\beta_i,\sigma,\sigma'},
+	\]
+	with the first physical index the ket/output index and the second the bra/input index.
+	The routing in the two-site contraction above is therefore convention-dependent and should
+	be used exactly as written.
+	
+	\subsection{Vectorization and local eigensolver interface}
+	
+	If
+	\[
+	\Theta^{[i,i+1]} \in
+	\mathbb{C}^{D_{i-1}\times d_i \times d_{i+1}\times D_{i+1}},
+	\]
+	then the local vector-space dimension is
+	\[
+	N_{\mathrm{loc}} = D_{i-1} d_i d_{i+1} D_{i+1}.
+	\]
+	The eigensolver vector
+	\[
+	v \in \mathbb{C}^{N_{\mathrm{loc}}}
+	\]
+	is identified with $\Theta$ by
+	\[
+	\Theta = \mathrm{reshape}(v,\,(D_{i-1},d_i,d_{i+1},D_{i+1})),
+	\]
+	again using the fixed C-order convention of Section~\ref{sec:reshape}.
+	
+	A practical wrapper is
+	\begin{verbatim}
+		def heff_two_site_matvec(v, L, W1, W2, R, Dl, d1, d2, Dr):
+		Theta = v.reshape((Dl, d1, d2, Dr), order='C')
+		X  = np.einsum('byx,yuvz->bxuvz', L, Theta)
+		Y  = np.einsum('bBus,bxuvz->Bxsvz', W1, X)
+		Z  = np.einsum('BCvt,Bxsvz->Cxstz', W2, Y)
+		HT = np.einsum('Cxstz,Cza->xsta', Z, R)
+		return HT.reshape(Dl * d1 * d2 * Dr, order='C')
+	\end{verbatim}
+	
+	This routine is then passed to \texttt{LinearOperator} and solved by Lanczos or Davidson
+	exactly as in the one-site case.
+	
+	\subsection{Validation strategy}
+	
+	For small systems, the dense matrix generated by repeated application of the matrix-free
+	two-site routine above should be compared entrywise against the exact projected operator
+	\[
+	P^\dagger H P.
+	\]
+	This is the decisive correctness test for the environment-based implementation.
+	
+	\paragraph{Important warning.}
+	Hermiticity alone is not a sufficient diagnostic. In the present conventions, one can
+	obtain a two-site environment-built operator that is Hermitian and numerically stable,
+	yet still incorrect because of an index-order mismatch in the left environment or in the
+	MPO physical-index routing. Therefore the contraction sequence in
+	Eqs.~\eqref{eq:two-site-step1}--\eqref{eq:two-site-step4} should be treated as the
+	authoritative implementation for the present conventions.
+	
+	\section{Matrix-free eigensolver interface for local effective Hamiltonians}
+	\label{sec:matfree}
+	
+	In practical DMRG implementations, the local effective Hamiltonian should \emph{never}
+	be formed as a dense matrix except for unit tests on very small systems. Instead, one
+	implements only the map
+	\[
+	v \mapsto \mathcal{H}_{\mathrm{eff}} v,
+	\]
+	and passes this map to an iterative eigensolver such as Lanczos or Davidson.
+	
+	\paragraph{Important convention warning.}
+	For the tensor, MPO, and environment conventions adopted in these notes, the stored
+	left environment tensor enters the local effective-Hamiltonian action with its two
+	MPS-bond indices interchanged. In array form, if the stored left environment is
+	\texttt{L[b,x,y]}, then the validated local matrix-free contractions use it as
+	\texttt{L[b,y,x]}. This point is subtle but essential. A local operator built from
+	environments can remain Hermitian even when this ordering is wrong, while still failing
+	to agree with the true projected operator
+	\[
+	P^\dagger H P.
+	\]
+	Accordingly, the one-site and two-site matrix-free contractions given below should be
+	treated as the authoritative implementations for the conventions of these notes.
+	
+	\subsection{One-site local solve}
+	
+	For a one-site center tensor
+	\[
+	M^{[i]} \in \mathbb{C}^{D_{i-1}\times d_i \times D_i},
+	\]
+	define the local vector-space dimension
+	\[
+	N_{\mathrm{loc}} = D_{i-1} d_i D_i.
+	\]
+	The eigensolver vector
+	\[
+	v\in\mathbb{C}^{N_{\mathrm{loc}}}
+	\]
+	is identified with the tensor $M^{[i]}$ by
+	\begin{equation}
+		M^{[i]} = \mathrm{reshape}(v,\,(D_{i-1},d_i,D_i)),
+	\end{equation}
+	using the fixed C-order convention of Section~\ref{sec:reshape}. After applying the
+	local effective Hamiltonian, the result is reshaped back to a vector with the same convention.
+	
+	\paragraph{Validated one-site contraction.}
+	The one-site matrix-free action is the validated contraction defined in
+	Section~\ref{sec:one-site-heff}. In array form, with stored environment tensor
+	\texttt{L[b,x,y]}, local tensor \texttt{M[y,s,z]}, MPO tensor \texttt{W[b,B,s,t]},
+	and right environment \texttt{R[B,z,a]}, the authoritative contraction is
+	\begin{verbatim}
+		X  = np.einsum('byx,ysz->bxsz', L, M)
+		Y  = np.einsum('bBst,bxsz->Bxtz', W, X)
+		HM = np.einsum('Bxtz,Bza->xta', Y, R)
+	\end{verbatim}
+	
+	\paragraph{Matrix-free wrapper.}
+	A practical NumPy/\texttt{scipy} interface is:
+	\begin{verbatim}
+		from scipy.sparse.linalg import LinearOperator, eigsh
+		
+		def heff_one_site_matvec(v, L, W, R, Dl, d, Dr):
+		M = v.reshape((Dl, d, Dr), order='C')
+		X  = np.einsum('byx,ysz->bxsz', L, M)
+		Y  = np.einsum('bBst,bxsz->Bxtz', W, X)
+		HM = np.einsum('Bxtz,Bza->xta', Y, R)
+		return HM.reshape(Dl * d * Dr, order='C')
+		
+		Nloc = Dl * d * Dr
+		Heff = LinearOperator(
+		shape=(Nloc, Nloc),
+		matvec=lambda v: heff_one_site_matvec(v, L, W, R, Dl, d, Dr),
+		dtype=np.complex128
+		)
+		
+		E, vec = eigsh(Heff, k=1, which='SA', v0=v0)
+		M = vec.reshape((Dl, d, Dr), order='C')
+	\end{verbatim}
+	
+	Here \texttt{v0} should be the current local tensor flattened with the same reshape convention:
+	\begin{verbatim}
+		v0 = M_current.reshape(Nloc, order='C')
+	\end{verbatim}
+	
+	\paragraph{Hermiticity and correctness checks.}
+	For a Hermitian MPO and correctly built environments, the local operator should satisfy
+	\[
+	\langle x, \mathcal{H}_{\mathrm{eff}} y\rangle
+	=
+	\langle \mathcal{H}_{\mathrm{eff}} x, y\rangle
+	\]
+	up to numerical precision. However, Hermiticity alone is not a sufficient correctness test.
+	For small systems, one should also compare the dense matrix obtained from the matrix-free
+	routine against the exact projected operator
+	\[
+	P^\dagger H P.
+	\]
+	
+	\subsection{Two-site local solve}
+	
+	For a two-site center tensor
+	\[
+	\Theta^{[i,i+1]} \in
+	\mathbb{C}^{D_{i-1}\times d_i \times d_{i+1}\times D_{i+1}},
+	\]
+	the local vector-space dimension is
+	\[
+	N_{\mathrm{loc}} = D_{i-1} d_i d_{i+1} D_{i+1}.
+	\]
+	Again, the eigensolver vector $v$ is identified with the tensor $\Theta$ by
+	\begin{equation}
+		\Theta = \mathrm{reshape}(v,\,(D_{i-1},d_i,d_{i+1},D_{i+1})).
+	\end{equation}
+	After applying the local effective Hamiltonian, the output tensor is flattened back
+	to a vector using the same C-order convention.
+	
+	\paragraph{Validated two-site contraction.}
+	The two-site matrix-free action is the validated contraction defined in
+	Section~\ref{sec:two-site-heff}. In array form, with stored left environment
+	\texttt{L[b,x,y]}, two-site tensor \texttt{Theta[y,u,v,z]}, MPO tensors
+	\texttt{W1[b,B,u,s]} and \texttt{W2[B,C,v,t]}, and stored right environment
+	\texttt{R[C,z,a]}, the authoritative contraction is
+	\begin{verbatim}
+		X  = np.einsum('byx,yuvz->bxuvz', L, Theta)
+		Y  = np.einsum('bBus,bxuvz->Bxsvz', W1, X)
+		Z  = np.einsum('BCvt,Bxsvz->Cxstz', W2, Y)
+		HT = np.einsum('Cxstz,Cza->xsta', Z, R)
+	\end{verbatim}
+	
+	\paragraph{Matrix-free wrapper.}
+	A practical wrapper is
+	\begin{verbatim}
+		def heff_two_site_matvec(v, L, W1, W2, R, Dl, d1, d2, Dr):
+		Theta = v.reshape((Dl, d1, d2, Dr), order='C')
+		X  = np.einsum('byx,yuvz->bxuvz', L, Theta)
+		Y  = np.einsum('bBus,bxuvz->Bxsvz', W1, X)
+		Z  = np.einsum('BCvt,Bxsvz->Cxstz', W2, Y)
+		HT = np.einsum('Cxstz,Cza->xsta', Z, R)
+		return HT.reshape(Dl * d1 * d2 * Dr, order='C')
+	\end{verbatim}
+	and this is passed to \texttt{LinearOperator} in the same way as for the one-site case.
+	
+	\paragraph{Practical remark.}
+	The two-site contraction above was explicitly validated against the dense projected operator
+	\[
+	P^\dagger H P
+	\]
+	for small systems. This validation is essential, because more naive einsum routings can
+	produce Hermitian local operators that are nevertheless incorrect.
+	
+	\subsection{Lanczos versus Davidson}
+	
+	For first implementations, Lanczos is usually sufficient and easiest to access through
+	standard sparse-eigensolver interfaces. Davidson can be advantageous when the local
+	dimension becomes larger or when a useful diagonal preconditioner is available.
+	
+	\begin{itemize}
+		\item \textbf{Lanczos:} simplest robust choice for initial code.
+		\item \textbf{Davidson:} often faster for large local problems, but requires more implementation effort.
+	\end{itemize}
+	
+	In both cases, using the current local tensor as the initial guess is essential for sweep efficiency.
+	
+	\subsection{Dense reference for unit tests}
+	
+	For very small dimensions only, one should explicitly build the dense local projected operator
+	\[
+	H_{\mathrm{eff}} \in \mathbb{C}^{N_{\mathrm{loc}}\times N_{\mathrm{loc}}},
+	\]
+	and compare:
+	\begin{itemize}
+		\item dense matrix--vector multiplication versus the matrix-free routine,
+		\item lowest eigenvalue from dense diagonalization versus Lanczos/Davidson,
+		\item Hermiticity of the dense reference matrix,
+		\item agreement of the environment-built operator with the exact projected operator
+		\(P^\dagger H P\).
+	\end{itemize}
+	
+	This unit test should be performed for both the one-site and two-site local solvers before
+	running full sweeps.
+	
+	\section{Two-site DMRG}
+	
+	Two-site DMRG is the most robust finite-system ground-state algorithm and is recommended for a first implementation. It avoids many local-minimum problems of one-site DMRG and dynamically adjusts the bond dimension before truncation.
+	
+	\subsection{Two-site mixed-canonical form}
+	
+	At bond $(i,i+1)$, define left-orthonormal Schmidt states on sites $1,\dots,i-1$ and right-orthonormal Schmidt states on sites $i+2,\dots,L$:
+	\[
+	\ket{\alpha_{i-1}}_L,\qquad \ket{\alpha_{i+1}}_R.
+	\]
+	The variational two-site center tensor is
+	\begin{equation}
+		\Theta^{[i,i+1]}_{\alpha_{i-1},\sigma_i,\sigma_{i+1},\alpha_{i+1}},
+		\label{eq:theta-def-alg}
+	\end{equation}
+	and the state is written as
+	\begin{equation}
+		\ket{\psi}
+		=
+		\sum_{\alpha_{i-1},\sigma_i,\sigma_{i+1},\alpha_{i+1}}
+		\Theta^{[i,i+1]}_{\alpha_{i-1},\sigma_i,\sigma_{i+1},\alpha_{i+1}}
+		\ket{\alpha_{i-1}}_L \ket{\sigma_i}\ket{\sigma_{i+1}} \ket{\alpha_{i+1}}_R.
+		\label{eq:two-site-state-alg}
+	\end{equation}
+	
+	This form is the direct analogue of the usual two-site DMRG superblock state and should be treated as the primary variational object. It is not necessary to define $\Theta$ through pre-existing tensors $A^{[i]}$ and $B^{[i+1]}$.
+	
+	\subsection{Solving the local problem}
+	
+	Given a matrix-free routine for $\Theta \mapsto \mathcal{H}_{\mathrm{eff}}\Theta$, solve for the lowest eigenpair using Lanczos or Davidson:
+	\begin{equation}
+		\mathcal{H}_{\mathrm{eff}} \Theta = E \Theta.
+	\end{equation}
+	
+	The local vector space dimension is
+	\begin{equation}
+		N_{\mathrm{loc}} = D_{i-1} d_i d_{i+1} D_{i+1}.
+	\end{equation}
+	
+	For spin-$1/2$ chains with uniform physical dimension $d_i=d_{i+1}=2$, this is
+	\[
+	N_{\mathrm{loc}} = 4 D_{i-1} D_{i+1}.
+	\]
+	
+	The eigensolver should accept an initial guess. A good choice is the current two-site center tensor before optimization, flattened with the same C-order convention used everywhere else. This substantially accelerates convergence once sweeps are underway.
+	
+	\subsection{SVD split and truncation}
+	
+	After optimization, reshape the two-site tensor as a matrix:
+	\begin{equation}
+		\Theta_{(\alpha_{i-1}\sigma_i),(\sigma_{i+1}\alpha_{i+1})}
+		\in \mathbb{C}^{(D_{i-1}d_i)\times(d_{i+1}D_{i+1})}.
+		\label{eq:theta-matrix}
+	\end{equation}
+	
+	Compute the reduced SVD:
+	\begin{equation}
+		\Theta = U S V^\dagger.
+		\label{eq:theta-svd}
+	\end{equation}
+	
+	Let
+	\[
+	D_{\mathrm{full}} = \mathrm{rank}(\Theta),\qquad
+	D_{\mathrm{new}} = \min(D_{\max}, D_{\mathrm{full}})
+	\]
+	or more generally choose $D_{\mathrm{new}}$ from a singular-value threshold or discarded-weight tolerance. Keep only the largest $D_{\mathrm{new}}$ singular values.
+	
+	The discarded weight is
+	\begin{equation}
+		\eta^{[i]} = \sum_{j>D_{\mathrm{new}}} s_j^2.
+		\label{eq:discarded-weight}
+	\end{equation}
+	
+	For a left-to-right sweep, define
+	\begin{equation}
+		A^{[i]} \leftarrow \mathrm{reshape}\!\left(U,\,(D_{i-1},d_i,D_{\mathrm{new}})\right),
+		\label{eq:two-site-left-update}
+	\end{equation}
+	\begin{equation}
+		M^{[i+1]} \leftarrow \mathrm{reshape}\!\left(SV^\dagger,\,(D_{\mathrm{new}},d_{i+1},D_{i+1})\right).
+		\label{eq:two-site-center-right}
+	\end{equation}
+	
+	Then $A^{[i]}$ is left-canonical, and the orthogonality center has moved to site $i+1$.
+	
+	For a right-to-left sweep, instead use
+	\begin{equation}
+		M^{[i]} \leftarrow \mathrm{reshape}\!\left(US,\,(D_{i-1},d_i,D_{\mathrm{new}})\right),
+		\label{eq:two-site-center-left}
+	\end{equation}
+	\begin{equation}
+		B^{[i+1]} \leftarrow \mathrm{reshape}\!\left(V^\dagger,\,(D_{\mathrm{new}},d_{i+1},D_{i+1})\right),
+		\label{eq:two-site-right-update}
+	\end{equation}
+	so that $B^{[i+1]}$ is right-canonical and the orthogonality center moves to site $i$.
+	
+	\paragraph{Important reshape note.}
+	The reshapes in Eqs.~\eqref{eq:two-site-left-update}--\eqref{eq:two-site-right-update} are only correct if Eq.~\eqref{eq:theta-matrix} uses exactly the same flattening convention as the code.
+	
+	\subsection{Environment updates}
+	
+	After splitting the optimized two-site tensor, the environments must be updated so that
+	the next local problem is built in the correct mixed-canonical gauge.
+	
+	\paragraph{Left-to-right sweep.}
+	After obtaining the new left-canonical tensor $A^{[i]}$, update the left environment from
+	site $i$ to site $i+1$:
+	\begin{equation}
+		L^{[i+1]}_{\beta_i}(\alpha_i,\alpha'_i)
+		=
+		\sum_{\substack{
+				\alpha_{i-1},\alpha'_{i-1}\\
+				\sigma_i,\sigma_i'\\
+				\beta_{i-1}
+		}}
+		L^{[i]}_{\beta_{i-1}}(\alpha_{i-1},\alpha'_{i-1})
+		A^{[i]}_{\alpha_{i-1},\sigma_i,\alpha_i}
+		W^{[i]}_{\beta_{i-1},\beta_i,\sigma_i,\sigma_i'}
+		A^{[i]*}_{\alpha'_{i-1},\sigma_i',\alpha'_i}.
+	\end{equation}
+	
+	\paragraph{Right-to-left sweep.}
+	After obtaining the new right-canonical tensor $B^{[i+1]}$, update the right environment
+	from site $i+1$ to site $i$:
+	\begin{equation}
+		R^{[i]}_{\beta_i}(\alpha_i,\alpha'_i)
+		=
+		\sum_{\substack{
+				\alpha_{i+1},\alpha'_{i+1}\\
+				\sigma_{i+1},\sigma'_{i+1}\\
+				\beta_{i+1}
+		}}
+		B^{[i+1]}_{\alpha_i,\sigma_{i+1},\alpha_{i+1}}
+		W^{[i+1]}_{\beta_i,\beta_{i+1},\sigma_{i+1},\sigma'_{i+1}}
+		R^{[i+1]}_{\beta_{i+1}}(\alpha_{i+1},\alpha'_{i+1})
+		B^{[i+1]*}_{\alpha'_i,\sigma'_{i+1},\alpha'_{i+1}}.
+	\end{equation}
+	
+	\paragraph{Convention reminder.}
+	The formulas above define the \emph{stored} environments. As emphasized in
+	Section~\ref{sec:env}, for the conventions of these notes the stored left environment enters
+	the local effective-Hamiltonian action with its two MPS-bond indices interchanged relative
+	to its storage order. Thus the environment-recursion formulas and the local-action formulas
+	must not be conflated.
+	
+	\subsection{Full two-site sweep algorithm}
+	
+	\begin{algorithm}[H]
+		\caption{TwoSiteDMRG}
+		\begin{algorithmic}[1]
+			\Require MPO $\{W^{[i]}\}$, initial MPS $\{M^{[i]}\}$, max bond dimension $D_{\max}$
+			\Ensure approximate ground-state MPS and energy
+			\State bring initial MPS into mixed-canonical form
+			\State build all right environments $R^{[i]}$
+			\State initialize left boundary environment $L^{[1]}$
+			\Repeat
+			\Comment{Left-to-right sweep}
+			\For{$i=1$ to $L-1$}
+			\State form the current two-site center tensor $\Theta^{[i,i+1]}$
+			\State solve the lowest-eigenvalue problem $\mathcal{H}_{\mathrm{eff}}\Theta = E\Theta$
+			\State reshape $\Theta$ as in Eq.~\eqref{eq:theta-matrix}
+			\State compute reduced SVD $\Theta = U S V^\dagger$
+			\State truncate to $D_{\mathrm{new}}\le D_{\max}$
+			\State set $A^{[i]} \gets \mathrm{reshape}(U,(D_{i-1},d_i,D_{\mathrm{new}}))$
+			\State set $M^{[i+1]} \gets \mathrm{reshape}(S V^\dagger,(D_{\mathrm{new}},d_{i+1},D_{i+1}))$
+			\State record discarded weight $\eta^{[i]}$
+			\State update left environment $L^{[i+1]}$
+			\EndFor
+			\Comment{Right-to-left sweep}
+			\For{$i=L-1$ down to $1$}
+			\State form the current two-site center tensor $\Theta^{[i,i+1]}$
+			\State solve the lowest-eigenvalue problem
+			\State reshape $\Theta$ as in Eq.~\eqref{eq:theta-matrix}
+			\State compute reduced SVD $\Theta = U S V^\dagger$
+			\State truncate to $D_{\mathrm{new}}\le D_{\max}$
+			\State set $M^{[i]} \gets \mathrm{reshape}(US,(D_{i-1},d_i,D_{\mathrm{new}}))$
+			\State set $B^{[i+1]} \gets \mathrm{reshape}(V^\dagger,(D_{\mathrm{new}},d_{i+1},D_{i+1}))$
+			\State record discarded weight $\eta^{[i]}$
+			\State update right environment $R^{[i]}$
+			\EndFor
+			\Until{energy, variance, and discarded-weight criteria are converged}
+		\end{algorithmic}
+	\end{algorithm}
+	
+	\subsection{Practical comments for coding}
+	
+	\begin{itemize}
+		\item \textbf{This should be the first DMRG implementation.} It is much easier to debug than one-site DMRG.
+		\item \textbf{Keep the orthogonality center explicit.} During a left-to-right sweep, after the split the center lives on site $i+1$ as $M^{[i+1]}$; during a right-to-left sweep, it lives on site $i$ as $M^{[i]}$.
+		\item \textbf{Do not compare tensors directly across sweeps without gauge fixing.}
+		\item \textbf{Always unit test the local effective-Hamiltonian matvec} against a dense reference for small dimensions.
+		\item \textbf{Monitor the maximum discarded weight}
+		\[
+		\eta_{\max} = \max_i \eta^{[i]}
+		\]
+		during each sweep.
+		\item \textbf{Benchmark first against exact diagonalization} for small Heisenberg chains before attempting larger systems.
+	\end{itemize}
+	
+	\section{One-site DMRG}
+	\label{sec:one-site-dmrg}
+	
+	One-site DMRG is best treated as an advanced refinement of the two-site algorithm. In practice,
+	a robust implementation typically uses several two-site sweeps first and only then switches to
+	one-site sweeps, optionally with subspace expansion or density-matrix perturbation.
+	
+	\subsection{One-site mixed-canonical form}
+	
+	In one-site DMRG, the MPS is kept in mixed-canonical form with center at site $i$:
+	\begin{equation}
+		\ket{\psi}
+		=
+		\sum_{\alpha_{i-1},\sigma_i,\alpha_i}
+		M^{[i]}_{\alpha_{i-1},\sigma_i,\alpha_i}
+		\ket{\alpha_{i-1}}_L \ket{\sigma_i} \ket{\alpha_i}_R.
+	\end{equation}
+	
+	The local optimization is then performed over the center tensor $M^{[i]}$ while the left
+	and right Schmidt bases are kept fixed.
+	
+	\subsection{One-site sweep algorithm}
+	
+	\begin{algorithm}[H]
+		\caption{OneSiteDMRG}
+		\begin{algorithmic}[1]
+			\Require MPO $\{W^{[i]}\}$, initial MPS $\{M^{[i]}\}$, max bond dimension $D_{\max}$
+			\Ensure approximate ground-state MPS and energy
+			\State bring the initial MPS into mixed-canonical form
+			\State build all right environments
+			\State initialize the left boundary environment
+			\Repeat
+			\Comment{Left-to-right sweep}
+			\For{$i=1$ to $L-1$}
+			\State solve the one-site effective-Hamiltonian problem using the validated matrix-free contraction of Section~\ref{sec:matfree}
+			\State reshape the optimized center tensor as a left-grouped matrix
+			\State compute an SVD: $M^{[i]} = U S V^\dagger$
+			\State retain at most $D_{\max}$ singular values
+			\State reshape $U \to A^{[i]}$ as a left-canonical tensor
+			\State absorb $S V^\dagger$ into $M^{[i+1]}$
+			\State update $L^{[i+1]}$
+			\EndFor
+			\Comment{Right-to-left sweep}
+			\For{$i=L$ down to $2$}
+			\State solve the one-site effective-Hamiltonian problem using the validated matrix-free contraction of Section~\ref{sec:matfree}
+			\State reshape the optimized center tensor as a right-grouped matrix
+			\State compute an SVD: $M^{[i]} = U S V^\dagger$
+			\State retain at most $D_{\max}$ singular values
+			\State reshape $V^\dagger$ using the inverse of Eq.~\eqref{eq:right-group} to obtain a right-canonical tensor $B^{[i]}$
+			\State absorb $U S$ into $M^{[i-1]}$
+			\State update $R^{[i-1]}$
+			\EndFor
+			\Until{energy and variance are converged}
+		\end{algorithmic}
+	\end{algorithm}
+	
+	\paragraph{Remark.}
+	In standard one-site DMRG, the SVD step mainly regauges the state and shifts the orthogonality
+	center; unlike two-site DMRG, it does not naturally enlarge the accessible bond space. This is
+	one reason why one-site DMRG is more prone to local minima unless combined with subspace expansion
+	or density-matrix perturbation.
+	
+	\paragraph{Convention reminder.}
+	For the conventions of these notes, the one-site local matrix-free action used inside one-site
+	DMRG must be the validated contraction summarized in Section~\ref{sec:matfree}, rather than a
+	naive contraction built directly from the stored left environment without the required bond-index
+	interchange.
+	
+	\paragraph{Practical warning.}
+	One-site DMRG is prone to local minima and should not be used as a first standalone implementation.
+	A robust implementation should either:
+	\begin{itemize}
+		\item start with several two-site sweeps, or
+		\item use a subspace-expansion / density-matrix perturbation method.
+	\end{itemize}
+	
+	\section{AKLT benchmark state}
+	An exact MPS representation of the AKLT state is, up to gauge, given by
+	\begin{align}
+		A^{+} &= \begin{pmatrix} 0 & \sqrt{2/3} \\ 0 & 0 \end{pmatrix},\\
+		A^{0} &= \begin{pmatrix} -1/\sqrt{3} & 0 \\ 0 & 1/\sqrt{3} \end{pmatrix},\\
+		A^{-} &= \begin{pmatrix} 0 & 0 \\ -\sqrt{2/3} & 0 \end{pmatrix}.
+	\end{align}
+	For this gauge, the tensors satisfy
+	\begin{equation}
+		\sum_{\sigma\in\{+,0,-\}} A^\sigma A^{\sigma\dagger} = \Id_2,
+	\end{equation}
+	so they are \emph{right-canonical} in the convention of Eq.~\eqref{eq:right-canonical}.
+	This state is an excellent benchmark:
+	\begin{itemize}
+		\item the AKLT ground state admits an exact MPS representation with bond dimension $D=2$,
+		\item for open boundary conditions, the AKLT Hamiltonian has a fourfold degenerate ground-state manifold associated with spin-$1/2$ edge modes, and every ground state in that manifold has exact energy
+		\[
+		E_0 = -\frac23 (L-1).
+		\]
+	\end{itemize}
+	
+	\section{Convergence diagnostics}
+	
+	Reliable convergence diagnostics for DMRG should include:
+	\begin{itemize}
+		\item energy change
+		\[
+		|\Delta E| < \eps_E,
+		\]
+		\item energy variance
+		\[
+		\sigma_H^2 = \bra{\psi}H^2\ket{\psi} - \bra{\psi}H\ket{\psi}^2,
+		\]
+		\item maximum discarded weight during a sweep,
+		\item stability of entanglement spectrum or local observables.
+	\end{itemize}
+	
+	\paragraph{Practical note.}
+	For small systems, the variance can be benchmarked against dense linear algebra. In production calculations, it can be obtained either from an MPO representation of $H^2$ or by first computing $H\ket{\psi}$ as an MPS and then evaluating its norm. One should keep in mind that an MPO for $H^2$ can have a significantly larger bond dimension than the MPO for $H$.
+	
+	\paragraph{Important caution.}
+	Direct tensor-by-tensor comparison is not gauge-invariant and should \emph{not} be used as a primary convergence criterion unless the gauge is fixed identically before comparison.
+	
+	\section{Implementation checklist}
+	
+	Before production calculations, the implementation should be validated in a strictly
+	controlled order. The purpose of this checklist is not only to test individual routines,
+	but also to ensure that the tensor-index conventions, reshape conventions, and environment
+	contractions are mutually consistent.
+	
+	\begin{enumerate}
+		\item \textbf{Canonicalization test.}
+		Starting from random tensors or a random MPS, perform left- and right-canonicalization
+		sweeps and verify the defining relations
+		\begin{align}
+			\sum_{\alpha_{i-1},\sigma_i}
+			A^{[i]}_{\alpha_{i-1},\sigma_i,\alpha_i}
+			A^{[i]*}_{\alpha_{i-1},\sigma_i,\alpha_i'}
+			&= \delta_{\alpha_i,\alpha_i'},
+			\\
+			\sum_{\sigma_i,\alpha_i}
+			B^{[i]}_{\alpha_{i-1},\sigma_i,\alpha_i}
+			B^{[i]*}_{\alpha_{i-1}',\sigma_i,\alpha_i}
+			&= \delta_{\alpha_{i-1},\alpha_{i-1}'}.
+		\end{align}
+		These tests verify both the QR/SVD logic and the fixed reshape conventions.
+		
+		\item \textbf{MPO construction test.}
+		For small chains, such as $L=2,3,4$, contract the MPO to a dense matrix and compare
+		it entrywise against a Hamiltonian built directly from Kronecker products of local operators.
+		This test should be performed for both the Heisenberg MPO and the AKLT MPO.
+		
+		\item \textbf{Environment-recursion test.}
+		Verify that the left and right environment updates reproduce brute-force contractions
+		on very small systems. This confirms that the recursive environment-building routines are
+		internally consistent.
+		
+		\item \textbf{Hermiticity test of local matrix-free operators.}
+		For random small tensors, verify numerically that
+		\[
+		\langle x,\mathcal{H}_{\mathrm{eff}} y\rangle
+		=
+		\langle \mathcal{H}_{\mathrm{eff}} x, y\rangle
+		\]
+		up to numerical precision, for both one-site and two-site matrix-free local actions.
+		
+		\item \textbf{One-site projected-operator test.}
+		For a small mixed-canonical MPS, explicitly construct the dense projected one-site operator
+		\[
+		P^\dagger H P
+		\]
+		and compare it against the dense matrix obtained by repeated application of the matrix-free
+		one-site environment-based local action.
+		
+		For the conventions of these notes, the validated one-site contraction is
+		\begin{verbatim}
+			X  = np.einsum('byx,ysz->bxsz', L, M)
+			Y  = np.einsum('bBst,bxsz->Bxtz', W, X)
+			HM = np.einsum('Bxtz,Bza->xta', Y, R)
+		\end{verbatim}
+		
+		\item \textbf{Two-site projected-operator test.}
+		For a small mixed-canonical MPS, explicitly construct the dense projected two-site operator
+		\[
+		P^\dagger H P
+		\]
+		and compare it against the dense matrix obtained by repeated application of the matrix-free
+		two-site environment-based local action.
+		
+		For the conventions of these notes, the validated two-site contraction is
+		\begin{verbatim}
+			X  = np.einsum('byx,yuvz->bxuvz', L, Theta)
+			Y  = np.einsum('bBus,bxuvz->Bxsvz', W1, X)
+			Z  = np.einsum('BCvt,Bxsvz->Cxstz', W2, Y)
+			HT = np.einsum('Cxstz,Cza->xsta', Z, R)
+		\end{verbatim}
+		
+		This comparison against the dense projected operator is the decisive local correctness test.
+		
+		\item \textbf{Two-site DMRG benchmark for Heisenberg chains.}
+		Run finite-system two-site DMRG for small spin-$1/2$ Heisenberg chains and compare the
+		converged MPS energy against exact diagonalization. Agreement to numerical precision on
+		small systems is the main global benchmark for the implementation.
+		
+		\item \textbf{AKLT benchmark.}
+		Validate the AKLT implementation in two ways:
+		\begin{itemize}
+			\item compare the DMRG ground-state energy against the exact open-chain result
+			\[
+			E_0 = -\frac23 (L-1),
+			\]
+			\item evaluate the energy of the exact AKLT MPS and verify that it reproduces the same result.
+		\end{itemize}
+		
+		\item \textbf{Convergence diagnostics in production runs.}
+		After the implementation is validated locally and globally, monitor in larger calculations:
+		\begin{itemize}
+			\item energy change between sweeps,
+			\item maximum discarded weight,
+			\item eventual energy variance,
+			\item stability of local observables and entanglement spectra.
+		\end{itemize}
+	\end{enumerate}
+	
+	\paragraph{Most important practical warning.}
+	For the conventions used in these notes, Hermiticity of the environment-built local operator
+	is \emph{not} sufficient to guarantee correctness. In particular, an incorrect treatment of the
+	stored left environment or an incorrect MPO physical-index routing can still yield a Hermitian
+	local operator, yet one that differs from the true projected operator \(P^\dagger H P\).
+	Therefore no full DMRG sweeps should be trusted until the one-site and two-site local operators
+	have been compared explicitly against dense projected references on small systems.
+	
+	\paragraph{Recommended debugging order.}
+	If a full DMRG calculation produces stable but incorrect energies, the safest debugging sequence is:
+	\begin{enumerate}
+		\item verify canonicalization,
+		\item verify MPO-to-dense agreement,
+		\item verify left and right environment updates separately,
+		\item verify the one-site local projected operator,
+		\item verify the two-site local projected operator,
+		\item only then test full sweeps.
+	\end{enumerate}
+	In practice, the projected-operator tests are usually more informative than Hermiticity tests alone.
+	
+	\paragraph{Authoritative implementation templates.}
+	For the conventions of these notes, the one-site and two-site matrix-free contraction templates
+	written above should be treated as authoritative reference implementations. Future optimizations,
+	refactorings, or changes of contraction order should always be benchmarked back against these
+	forms on small systems before being used in production calculations.
+	
+	\section{Practical coding recommendation}
+	
+	For a first reliable implementation, the following strategy is strongly recommended.
+	
+	\begin{itemize}
+		\item \textbf{Implement two-site DMRG first.}
+		Among standard finite-system algorithms, two-site DMRG is the most robust place to begin.
+		It is substantially easier to debug than one-site DMRG, naturally allows bond dimensions to
+		adapt before truncation, and provides a direct setting in which the local variational space is
+		large enough to avoid many of the local-minimum problems of one-site updates.
+		
+		\item \textbf{Fix tensor conventions once and use them everywhere.}
+		In particular, fix:
+		\begin{itemize}
+			\item the MPS tensor convention
+			\[
+			A^{[i]}_{\alpha_{i-1},\sigma_i,\alpha_i},
+			\]
+			\item the MPO tensor convention
+			\[
+			W^{[i]}_{\beta_{i-1},\beta_i,\sigma_i,\sigma_i'},
+			\]
+			with the first physical index the ket/output index and the second the bra/input index,
+			\item the reshape rules used in QR, SVD, vectorization, and inverse reshaping,
+			\item the memory order, e.g.\ NumPy C-order.
+		\end{itemize}
+		Small inconsistencies in these choices are among the most common sources of silent errors.
+		
+		\item \textbf{Use reduced QR for regauging and SVD for truncation.}
+		Reduced QR without pivoting is convenient for moving orthogonality centers and constructing
+		canonical forms. SVD should be used when a truncation decision is required, because it gives
+		direct access to Schmidt singular values and discarded weights.
+		
+		\item \textbf{Keep the orthogonality-center structure explicit.}
+		In two-site DMRG, the variational object is the two-site tensor
+		\[
+		\Theta^{[i,i+1]}_{\alpha_{i-1},\sigma_i,\sigma_{i+1},\alpha_{i+1}},
+		\]
+		and the tensors to the left and right should be kept in the corresponding mixed-canonical form.
+		During a left-to-right sweep, after splitting the optimized two-site tensor, the center moves
+		to the right; during a right-to-left sweep, it moves to the left. This structure should be
+		reflected explicitly in the code.
+		
+		\item \textbf{Do not build dense local effective Hamiltonians in production sweeps.}
+		Except for very small validation tests, the local effective Hamiltonian should be accessed only
+		through a matrix-free map
+		\[
+		v \mapsto \mathcal{H}_{\mathrm{eff}} v.
+		\]
+		This is the only scalable strategy and is the natural interface to Lanczos or Davidson.
+		
+		\item \textbf{Treat the validated contraction templates as authoritative.}
+		For the conventions of these notes, the one-site and two-site local environment-based
+		contractions are subtle. In particular, the stored left environment enters the local action
+		with its MPS-bond indices interchanged, and the MPO physical-index routing in the two-site
+		action must be implemented exactly as in the validated contraction sequence.
+		These convention-dependent details should not be re-derived from memory during coding.
+		
+		\item \textbf{Benchmark against dense projected operators before full sweeps.}
+		Before running finite-system DMRG sweeps, one should verify on small systems that the
+		environment-built one-site and two-site local operators agree with the exact projected operators
+		\[
+		P^\dagger H P.
+		\]
+		This is a more stringent and more informative test than Hermiticity alone.
+		
+		\item \textbf{Benchmark against exact diagonalization on small systems.}
+		After the local-operator tests pass, run two-site DMRG for small Heisenberg chains and compare
+		the converged energy against exact diagonalization. This is the standard global correctness test.
+		
+		\item \textbf{Use the AKLT chain as an exact MPS benchmark.}
+		The AKLT model is particularly valuable because:
+		\begin{itemize}
+			\item the Hamiltonian has an exact MPO representation of modest bond dimension,
+			\item the ground state admits an exact MPS representation with bond dimension $D=2$,
+			\item the open-chain ground-state energy is known exactly,
+			\[
+			E_0 = -\frac23 (L-1).
+			\]
+		\end{itemize}
+		Therefore the AKLT chain tests simultaneously the MPO, the local solver, the sweep logic,
+		and the handling of exact low-bond-dimension MPS ground states.
+		
+		\item \textbf{Use the current local tensor as the eigensolver initial guess.}
+		In finite-system sweeps, the previously optimized local tensor provides an excellent initial
+		vector for Lanczos or Davidson. This is a major practical improvement in convergence speed.
+		
+		\item \textbf{Monitor discarded weights and, when available, variances.}
+		The energy alone is not always a sufficient convergence indicator. In production calculations,
+		one should monitor at least:
+		\begin{itemize}
+			\item the energy change between sweeps,
+			\item the maximum discarded weight during each sweep,
+			\item the eventual energy variance,
+			\item stability of local observables and entanglement spectra.
+		\end{itemize}
+	\end{itemize}
+	
+	\paragraph{Recommended order of development.}
+	A robust development sequence is:
+	\begin{enumerate}
+		\item local operators,
+		\item MPO construction,
+		\item canonicalization routines,
+		\item environment updates,
+		\item one-site projected-operator validation,
+		\item two-site projected-operator validation,
+		\item two-site DMRG benchmark for Heisenberg chains,
+		\item AKLT benchmark,
+		\item only afterward: one-site DMRG, variance evaluation, and further optimizations.
+	\end{enumerate}
+	
+	\paragraph{Most important practical warning.}
+	For the conventions used in these notes, a local operator built from environments can be
+	Hermitian and numerically stable while still being incorrect. This can happen if the stored
+	left environment is inserted into the local action with the wrong bond-index order, or if
+	the MPO physical-index routing in the local contraction is inconsistent with the chosen MPO
+	storage convention. Therefore full DMRG sweeps should \emph{not} be trusted until the
+	matrix-free local operator has been compared explicitly against the dense projected operator
+	\(P^\dagger H P\) on small systems.
+	
+	\paragraph{Final recommendation.}
+	In practical coding work, the safest philosophy is:
+	\begin{quote}
+		first validate the local operator, then validate small-system energies, and only then scale up.
+	\end{quote}
+	For environment-based DMRG implementations, this order is not merely convenient; it is essential.
+	
+	\end{document}
