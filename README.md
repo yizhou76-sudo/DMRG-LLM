@@ -22,5 +22,3 @@ Both case-study folders collect the same kinds of evidence:
 
 - `DMRG/` keeps its historical subfolder names: `Markdown/`, `LaTeX/`, `Code/`, and `FigPrompt/`.
 - `Pfaffian-MPS/` uses explicit workflow subfolders: `Prompts/`, `Specifications/`, `Agent-Runs/`, `Skills/`, and `Summaries/`.
-
-Local virtual environments, Python caches, Claude local settings, `.DS_Store` files, duplicated source PDFs, and LaTeX auxiliary build files are excluded where applicable.
