@@ -1,1 +1,0 @@
-LLM conversations (Kimi 2.5, Gemini 3.1 Pro Preview, GPT 5.4, Claude 4.6) are in 'Markdown'. Generated Python code is in 'Code', LaTeX notes are in 'LaTeX', and figure plotting prompts (via Nano Banana 2) are in 'FigPrompt'.
